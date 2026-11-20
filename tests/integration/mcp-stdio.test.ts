@@ -19,6 +19,9 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { McpError } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { createWorkspaceResolver } from '../../src/bruno/workspace';
+import { childEnv } from '../helpers/child-env';
+import { EXPECTED_TOOLS } from '../helpers/expected-tools';
+import { textOf } from '../helpers/tool-text';
 
 const repoRoot = path.resolve(__dirname, '../..');
 
@@ -31,34 +34,6 @@ const repoRoot = path.resolve(__dirname, '../..');
 // a suite is running, so the copy and the retries are gone.
 const serverEntry = path.join(repoRoot, 'dist', 'index.js');
 
-/**
- * Every tool the server is expected to register, by wire name.
- *
- * Spelled out rather than derived so a rename or a dropped
- * `setup*Tool()` call fails here instead of silently shrinking the API that
- * clients see. Handler-level unit tests cannot notice either.
- */
-const EXPECTED_TOOLS = [
-  'create_collection',
-  'create_environment',
-  'update_environment',
-  'set_environment_variable',
-  'remove_environment_variable',
-  'write_request',
-  'move_request',
-  'add_test_script',
-  'remove_script',
-  'delete_request',
-  'list_collections',
-  'list_requests',
-  'get_collection_stats',
-  'run_collection',
-  'read_request',
-  'read_environment',
-  'unregister_collection',
-  'delete_collection',
-];
-
 interface Session {
   client: Client;
   transport: StdioClientTransport;
@@ -70,28 +45,6 @@ interface Session {
 
 const sessions: Session[] = [];
 let tmpRoot: string;
-
-/**
- * Child environment: the parent's, minus any BRUNO_* the developer running the
- * suite happens to have exported, plus the caller's explicit overrides. Without
- * the filter a local BRUNO_SSRF_ALLOWLIST would change what these tests prove.
- *
- * BRUNO_WORKSPACE_PATH is the exception, and passes through. tests/setup-workspace-isolation.ts
- * has already replaced whatever the developer exported with a throwaway file, so
- * it is no longer a local setting that could change an outcome — and stripping it
- * sent the child to the Bruno app's own workspace instead, which is how this suite
- * came to leave three entries per run in a maintainer's real registry, each of
- * them pointing at a temp directory that is deleted before the next run.
- */
-function childEnv(overrides: Record<string, string> = {}): Record<string, string> {
-  const base: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (value === undefined) continue;
-    if (key.startsWith('BRUNO_') && key !== 'BRUNO_WORKSPACE_PATH') continue;
-    base[key] = value;
-  }
-  return { ...base, ...overrides };
-}
 
 async function startServer(env: Record<string, string> = {}): Promise<Session> {
   const transport = new StdioClientTransport({
@@ -148,19 +101,6 @@ async function stopAllServers(): Promise<void> {
       }
     }
   }
-}
-
-interface ToolResult {
-  content?: Array<{ type: string; text?: string }>;
-  isError?: boolean;
-}
-
-function textOf(result: unknown): string {
-  const content = (result as ToolResult).content ?? [];
-  return content
-    .filter((part) => part.type === 'text')
-    .map((part) => part.text ?? '')
-    .join('\n');
 }
 
 async function waitForStderr(session: Session, needle: string, timeoutMs = 5000): Promise<void> {
