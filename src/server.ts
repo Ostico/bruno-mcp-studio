@@ -5,6 +5,7 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 
 // Import our Bruno modules
 import { createCollectionManager } from './bruno/collection.js';
@@ -107,11 +108,21 @@ export class BrunoMcpServer {
   }
 
   /**
-   * Start the MCP server
+   * Attach this server to a transport. stdio has one per process; HTTP mode
+   * builds one server per session and connects each to its own transport.
+   *
+   * Construction does no I/O (the four managers only set fields), which is
+   * what makes building a server per HTTP session cheap.
+   */
+  async connect(transport: Transport): Promise<void> {
+    await this.server.connect(transport);
+  }
+
+  /**
+   * Start the MCP server over stdio
    */
   async start(): Promise<void> {
-    const transport = new StdioServerTransport();
-    await this.server.connect(transport);
+    await this.connect(new StdioServerTransport());
 
     console.error('Bruno MCP Server started successfully! 🚀');
     console.error('Ready to author, read and run Bruno collections.');

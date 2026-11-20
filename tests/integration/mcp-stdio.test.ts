@@ -19,6 +19,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { McpError } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { createWorkspaceResolver } from '../../src/bruno/workspace';
+import { EXPECTED_TOOLS } from '../helpers/expected-tools';
 
 const repoRoot = path.resolve(__dirname, '../..');
 
@@ -30,34 +31,6 @@ const repoRoot = path.resolve(__dirname, '../..');
 // spawns. With a single hoisted build nothing deletes dist/ while
 // a suite is running, so the copy and the retries are gone.
 const serverEntry = path.join(repoRoot, 'dist', 'index.js');
-
-/**
- * Every tool the server is expected to register, by wire name.
- *
- * Spelled out rather than derived so a rename or a dropped
- * `setup*Tool()` call fails here instead of silently shrinking the API that
- * clients see. Handler-level unit tests cannot notice either.
- */
-const EXPECTED_TOOLS = [
-  'create_collection',
-  'create_environment',
-  'update_environment',
-  'set_environment_variable',
-  'remove_environment_variable',
-  'write_request',
-  'move_request',
-  'add_test_script',
-  'remove_script',
-  'delete_request',
-  'list_collections',
-  'list_requests',
-  'get_collection_stats',
-  'run_collection',
-  'read_request',
-  'read_environment',
-  'unregister_collection',
-  'delete_collection',
-];
 
 interface Session {
   client: Client;

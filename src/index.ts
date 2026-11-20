@@ -8,6 +8,14 @@
 import { realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { createBrunoMcpServer } from './server.js';
+import { startHttpServer, type HttpServerHandle } from './http-server.js';
+import {
+  resolveTransportConfig,
+  TransportConfigError,
+  USAGE,
+  type HttpTransportConfig,
+  type TransportConfig,
+} from './transport-config.js';
 import {
   installUnhandledRejectionGuard,
   installUncaughtExceptionGuard,
@@ -20,6 +28,34 @@ async function main() {
     // enough), and Node's default policy would terminate the server. See
     // process-guards.ts for why this cannot live inside the script sandbox.
     installUnhandledRejectionGuard();
+
+    // Decided before anything is built. A bad setting prints one line and exits
+    // 2, never a stack: the error could otherwise drag the environment, and
+    // with it a token, into the output.
+    let config: TransportConfig;
+    try {
+      config = resolveTransportConfig(process.argv.slice(2), process.env);
+    } catch (error) {
+      if (error instanceof TransportConfigError) {
+        console.error(`bruno-mcp: ${error.message} (see bruno-mcp --help)`);
+        process.exit(2);
+      }
+      throw error;
+    }
+
+    if (config.kind === 'help') {
+      process.stdout.write(`${USAGE}\n`);
+      process.exit(0);
+    }
+
+    if (config.kind === 'http') {
+      await startHttp(config);
+      return;
+    }
+
+    if (config.ignoredArgs.length > 0) {
+      console.error(`bruno-mcp: ignoring unknown argument(s): ${config.ignoredArgs.join(' ')} (see bruno-mcp --help)`);
+    }
 
     // Create and start the Bruno MCP server
     const server = createBrunoMcpServer();
@@ -51,6 +87,31 @@ async function main() {
     console.error('Failed to start Bruno MCP Server:', error);
     process.exit(1);
   }
+}
+
+/** How long a signal waits for sessions to close before exiting anyway. */
+const SHUTDOWN_GRACE_MS = 3000;
+
+async function startHttp(config: HttpTransportConfig): Promise<void> {
+  // One process now serves every session, so a fatal error ends them all: the
+  // guard closes each session and the listener, then exits.
+  let handle: HttpServerHandle | undefined;
+  installUncaughtExceptionGuard({
+    onFatal: () => {
+      void handle?.close();
+    },
+  });
+
+  handle = await startHttpServer(config, createBrunoMcpServer);
+  const running = handle;
+
+  const shutdown = (): void => {
+    console.error('\nBruno MCP Server shutting down gracefully...');
+    const grace = new Promise<void>((resolve) => setTimeout(resolve, SHUTDOWN_GRACE_MS).unref());
+    void Promise.race([running.close(), grace]).finally(() => process.exit(0));
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
 }
 
 // Start the server if this file is run directly.
