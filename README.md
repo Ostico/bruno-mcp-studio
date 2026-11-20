@@ -238,7 +238,52 @@ only where an HTTP server is meant to start, not in a shell profile that stdio c
 also read. Under stdio, arguments the server does not recognise are ignored, as before,
 with a warning on stderr; under HTTP they are an error.
 
-Point the client at the `/mcp` endpoint and send the token. In Claude Code's config:
+`GET /healthz` answers `200 OK` with no token, for readiness checks. It reveals nothing
+else. `bruno-mcp --help` prints the options.
+
+Each client gets its own MCP session. Sessions end when the client closes them, after
+the idle timeout, or when the server stops; a client whose session expired starts a new
+one. At most 64 sessions are open at once.
+
+### The bearer token
+
+The server reads its tokens once, at startup, from `BRUNO_MCP_AUTH_TOKEN`, from a token
+file, or from both. Each token is at least 32 characters of visible ASCII with no
+spaces; `openssl rand -hex 32` makes a suitable one. A token file is the safer choice
+for anything long-lived, because it keeps the token out of the environment of every
+process the shell starts:
+
+```bash
+umask 077
+openssl rand -hex 32 > ~/.config/bruno-mcp.token     # one token per line
+bruno-mcp --transport http --auth-token-file ~/.config/bruno-mcp.token
+```
+
+Check that it works. The first call has no token and gets `401`; the second gets `200`
+and starts a session:
+
+```bash
+TOKEN="$(cat ~/.config/bruno-mcp.token)"
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8781/mcp
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8781/mcp \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"1"}}}'
+```
+
+Every client sends the same token in an `Authorization: Bearer <token>` header. With
+Claude Code, one command adds the server:
+
+```bash
+claude mcp add --transport http bruno http://127.0.0.1:8781/mcp \
+  --header "Authorization: Bearer $(cat ~/.config/bruno-mcp.token)"
+```
+
+That writes the token into Claude Code's config. To keep it out of a config file you
+commit, reference an environment variable instead: Claude Code expands `${NAME}` in an
+`.mcp.json` from the environment of the client, not of the server. In this example the
+client's variable is called `BRUNO_MCP_TOKEN`, and it must hold the same value the
+server was started with:
 
 ```json
 {
@@ -252,12 +297,13 @@ Point the client at the `/mcp` endpoint and send the token. In Claude Code's con
 }
 ```
 
-`GET /healthz` answers `200 OK` with no token, for readiness checks. It reveals nothing
-else. `bruno-mcp --help` prints the options.
-
-Each client gets its own MCP session. Sessions end when the client closes them, after
-the idle timeout, or when the server stops; a client whose session expired starts a new
-one. At most 64 sessions are open at once.
+To change the token, start the server with both tokens (comma-separated in
+`BRUNO_MCP_AUTH_TOKEN`, or one per line in the file), move each client to the new one,
+then restart the server with the new token alone. Tokens are read only at startup, so
+each change of the list needs a restart, which ends open sessions; clients start new
+ones on their next call. A missing or wrong token gets `401` with
+`WWW-Authenticate: Bearer`, and the token is never written to the server's log or echoed
+in a response.
 
 ## Quick start
 
