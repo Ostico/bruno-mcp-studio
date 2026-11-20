@@ -5,6 +5,37 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.0] - 2026-11-20
+
+### Added
+
+- **An opt-in HTTP transport, so one server can serve several clients.** `bruno-mcp
+  --transport http` (or `BRUNO_MCP_TRANSPORT=http`) serves MCP over Streamable HTTP at
+  `/mcp`, on `127.0.0.1:8781` unless `--host` / `--port` say otherwise. It refuses to
+  start without a bearer token (`BRUNO_MCP_AUTH_TOKEN`, comma-separated for rotation, or
+  a file named by `--auth-token-file`, at least 32 characters each); there is no
+  unauthenticated HTTP mode and no `--auth-token` flag, because a token on the command
+  line shows in `ps`. Every request must name an allowed host in `Host`, and in `Origin`
+  when one is sent, so a web page cannot reach the server through DNS rebinding;
+  loopback names and the bind address are always allowed, and `--allowed-hosts` adds
+  more (for example `host.docker.internal`). `GET /healthz` answers `OK` without a token.
+  Each `initialize` gets its own session with its own server instance; sessions close on
+  `DELETE`, after `BRUNO_MCP_SESSION_IDLE_MS` (30 minutes) idle, or on shutdown, and at
+  most 64 are open at once. Writes from different sessions to one file are serialised
+  by the same per-file lock stdio already used. stdio is still the default and is
+  unchanged.
+- **`bruno-mcp --help`** prints the transport options.
+
+### Changed
+
+- **Unrecognised command-line arguments are now reported.** The server always ignored
+  its arguments; under stdio it still does, but now says so on stderr
+  (`bruno-mcp: ignoring unknown argument(s): ...`), so a misspelt `--transport` is
+  visible instead of silently starting a stdio server. Under `--transport http` an
+  unrecognised argument is an error (exit code 2). The HTTP flags themselves
+  (`--host`, `--port`, `--auth-token-file`, `--allowed-hosts`) are refused without
+  `--transport http`, for the same reason.
+
 ## [2.5.0] - 2026-08-20
 
 ### Breaking changes

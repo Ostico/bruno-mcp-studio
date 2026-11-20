@@ -39,7 +39,7 @@ export class BrunoMcpServer {
         // Reported to the client on connect. Hand-maintained, and it had drifted
         // two releases behind package.json before anyone looked — which is what
         // `tests/unit/meta/version-matches-package.test.ts` now guards.
-        version: '2.5.0'
+        version: '2.6.0'
       },
       {
         // Says when to reach for this server as well as how, and names the case where
