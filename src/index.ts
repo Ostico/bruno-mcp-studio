@@ -93,22 +93,26 @@ async function main() {
 const SHUTDOWN_GRACE_MS = 3000;
 
 async function startHttp(config: HttpTransportConfig): Promise<void> {
-  // One process now serves every session, so a fatal error ends them all: the
-  // guard closes each session and the listener, then exits.
+  // Installed before the listener exists, so a crash while binding is reported
+  // like any other; until then there is nothing to close.
   let handle: HttpServerHandle | undefined;
+  const closeAll = async (): Promise<void> => {
+    await handle?.close();
+  };
+  // One process serves every session, so a fatal error ends them all: the
+  // guard closes each session and the listener, then exits.
   installUncaughtExceptionGuard({
     onFatal: () => {
-      void handle?.close();
+      void closeAll();
     },
   });
 
   handle = await startHttpServer(config, createBrunoMcpServer);
-  const running = handle;
 
   const shutdown = (): void => {
     console.error('\nBruno MCP Server shutting down gracefully...');
     const grace = new Promise<void>((resolve) => setTimeout(resolve, SHUTDOWN_GRACE_MS).unref());
-    void Promise.race([running.close(), grace]).finally(() => process.exit(0));
+    void Promise.race([closeAll(), grace]).finally(() => process.exit(0));
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);

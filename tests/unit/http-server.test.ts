@@ -1,15 +1,13 @@
 /**
  * The HTTP transport, in-process: the pure checks (token, Host, Origin) as
  * functions, and the request pipeline against a real listener on loopback.
- *
- * The client side is node:http, never fetch: fetch goes through undici's
- * process-global dispatcher, which another unit file reconfigures, and sharing
- * a worker with it fails at random. tests/integration/mcp-http.test.ts drives
- * the built server with the SDK client; this file is what measures src/.
+ * tests/integration/mcp-http.test.ts drives the built server with the SDK
+ * client; this file is what measures src/.
  */
 
 import { randomBytes } from 'node:crypto';
-import { request as httpRequest } from 'node:http';
+import type { ServerResponse } from 'node:http';
+import { setTimeout as sleep } from 'node:timers/promises';
 
 import {
   bearerTokenMatches,
@@ -25,6 +23,15 @@ import {
 } from '../../src/http-server';
 import { createBrunoMcpServer, type BrunoMcpServer } from '../../src/server';
 import type { HttpTransportConfig } from '../../src/transport-config';
+import {
+  INITIALIZE,
+  MCP_HEADERS,
+  openStream,
+  sendRequest,
+  TOOLS_LIST,
+  type Reply,
+  type RequestOptions,
+} from '../helpers/http-request';
 
 const TOKEN = randomBytes(32).toString('hex');
 const SECOND = randomBytes(32).toString('hex');
@@ -146,54 +153,64 @@ afterEach(async () => {
   await Promise.all(running.splice(0).map((handle) => handle.close()));
 });
 
-interface Reply {
-  status: number;
-  headers: Record<string, string | string[] | undefined>;
-  body: string;
-}
-
-function send(
-  port: number,
-  method: string,
-  path: string,
-  headers: Record<string, string> = {},
-  body?: string,
-): Promise<Reply> {
-  return new Promise((resolve, reject) => {
-    const req = httpRequest({ host: '127.0.0.1', port, method, path, headers, agent: false }, (res) => {
-      let text = '';
-      res.on('data', (chunk: Buffer) => {
-        text += chunk.toString('utf8');
-      });
-      res.on('end', () => resolve({ status: res.statusCode ?? 0, headers: res.headers, body: text }));
-    });
-    req.on('error', reject);
-    req.end(body);
-  });
-}
-
 const AUTH = { Authorization: `Bearer ${TOKEN}` };
-const MCP = { ...AUTH, 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' };
-const INITIALIZE = JSON.stringify({
-  jsonrpc: '2.0',
-  id: 1,
-  method: 'initialize',
-  params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'unit', version: '1' } },
-});
+/** Everything an authorised MCP POST carries. */
+const MCP = { ...AUTH, ...MCP_HEADERS };
+
+function send(port: number, method: string, path: string, headers: Record<string, string> = {}, body?: string) {
+  return sendRequest({ port, method, path, headers, body });
+}
+
+/** POST to /mcp as an authorised client, inside a session when one is given. */
+function post(port: number, body: string, sessionId?: string): Promise<Reply> {
+  const headers = sessionId === undefined ? MCP : { ...MCP, 'mcp-session-id': sessionId };
+  return send(port, 'POST', '/mcp', headers, body);
+}
 
 /** Initialize a session and return its id. */
 async function initialize(port: number): Promise<string> {
-  const reply = await send(port, 'POST', '/mcp', MCP, INITIALIZE);
+  const reply = await post(port, INITIALIZE);
   expect(reply.status).toBe(200);
   const id = reply.headers['mcp-session-id'];
   expect(typeof id).toBe('string');
   return id as string;
 }
 
+/** Open the session's SSE stream and leave it open. */
+function openSse(port: number, sessionId: string) {
+  return openStream({
+    port,
+    method: 'GET',
+    path: '/mcp',
+    headers: { ...AUTH, Accept: 'text/event-stream', 'mcp-session-id': sessionId },
+  });
+}
+
 /** The JSON-RPC payload inside an SSE reply. */
 function sseData(body: string): { result?: { tools?: Array<{ name: string }> } } {
   const line = body.split('\n').find((l) => l.startsWith('data: '));
   return JSON.parse(line!.slice('data: '.length));
+}
+
+/** Poll until a condition holds; fails the test after about a second. */
+async function waitUntil(condition: () => boolean): Promise<void> {
+  for (let i = 0; i < 100 && !condition(); i++) await sleep(10);
+  expect(condition()).toBe(true);
+}
+
+/**
+ * A factory that records a spy on every server's stop(). `wrap` can change a
+ * server before it is handed out.
+ */
+function spiedFactory(wrap: (server: BrunoMcpServer) => void = () => undefined) {
+  const stops: jest.SpyInstance[] = [];
+  const factory = (): BrunoMcpServer => {
+    const server = createBrunoMcpServer();
+    wrap(server);
+    stops.push(jest.spyOn(server, 'stop'));
+    return server;
+  };
+  return { factory, stops };
 }
 
 describe('startHttpServer', () => {
@@ -234,9 +251,9 @@ describe('startHttpServer', () => {
     expect(get).toMatchObject({ status: 200, body: 'OK' });
     expect(get.headers['content-type']).toBe('text/plain');
     expect((await send(port, 'HEAD', '/healthz')).status).toBe(200);
-    const post = await send(port, 'POST', '/healthz');
-    expect(post.status).toBe(405);
-    expect(post.headers.allow).toBe('GET, HEAD');
+    const postReply = await send(port, 'POST', '/healthz');
+    expect(postReply.status).toBe(405);
+    expect(postReply.headers.allow).toBe('GET, HEAD');
   });
 
   it('checks Host before anything else, /healthz included', async () => {
@@ -281,33 +298,29 @@ describe('startHttpServer', () => {
 
   it('answers -32700 to a body that is not JSON', async () => {
     const { port } = await start();
-    const reply = await send(port, 'POST', '/mcp', MCP, '{not json');
+    const reply = await post(port, '{not json');
     expect(reply.status).toBe(400);
     expect(JSON.parse(reply.body).error.code).toBe(-32700);
   });
 
-  /** POST a body of `size` bytes, either with a Content-Length or chunked. */
+  /** POST `size` bytes of spaces, either with a Content-Length or chunked. */
   function postBody(port: number, size: number, chunked: boolean): Promise<Reply> {
-    return new Promise((resolve, reject) => {
-      const headers: Record<string, string> = chunked
+    const options: RequestOptions = {
+      port,
+      method: 'POST',
+      path: '/mcp',
+      headers: chunked
         ? { ...MCP, 'Transfer-Encoding': 'chunked' }
-        : { ...MCP, 'Content-Length': String(size) };
-      const req = httpRequest({ host: '127.0.0.1', port, method: 'POST', path: '/mcp', headers, agent: false }, (res) => {
-        let text = '';
-        res.on('data', (chunk: Buffer) => {
-          text += chunk.toString('utf8');
-        });
-        res.on('end', () => resolve({ status: res.statusCode ?? 0, headers: res.headers, body: text }));
-      });
-      // An error here means the server reset the connection instead of
-      // answering, which is the failure these tests exist to catch.
-      req.on('error', reject);
-      const chunk = Buffer.alloc(256 * 1024, 0x20);
-      for (let sent = 0; sent < size; sent += chunk.length) {
-        req.write(chunk.subarray(0, Math.min(chunk.length, size - sent)));
-      }
-      req.end();
-    });
+        : { ...MCP, 'Content-Length': String(size) },
+      write: (req) => {
+        const chunk = Buffer.alloc(256 * 1024, 0x20);
+        for (let sent = 0; sent < size; sent += chunk.length) {
+          req.write(chunk.subarray(0, Math.min(chunk.length, size - sent)));
+        }
+        req.end();
+      },
+    };
+    return sendRequest(options);
   }
 
   it.each([
@@ -333,31 +346,29 @@ describe('startHttpServer', () => {
 
   it('answers 500 and logs only the message when a body read fails', async () => {
     const { port, logs } = await start();
-    await new Promise<void>((resolve) => {
-      const req = httpRequest({
-        host: '127.0.0.1',
-        port,
-        method: 'POST',
-        path: '/mcp',
-        headers: { ...MCP, 'Content-Length': '1000' },
-      });
-      req.on('error', () => resolve());
-      req.write('{"partial":');
-      // Abort mid-body: the server's read fails with "aborted".
-      setTimeout(() => req.destroy(), 50);
+    const aborted = sendRequest({
+      port,
+      method: 'POST',
+      path: '/mcp',
+      headers: { ...MCP, 'Content-Length': '1000' },
+      // Cut the body short: the server's read fails with "aborted".
+      write: (req) => {
+        req.write('{"partial":');
+        setTimeout(() => req.destroy(), 50);
+      },
     });
-    for (let i = 0; i < 50 && logs.length < 2; i++) await new Promise((r) => setTimeout(r, 10));
+    await expect(aborted).rejects.toThrow();
+    await waitUntil(() => logs.length >= 2);
     expect(logs[1]).toMatch(/^\[bruno-mcp http\] request failed: /);
     expect(logs.join('\n')).not.toContain(TOKEN);
   });
 
   it('answers 400 to a non-initialize request, or a GET, without a session', async () => {
     const { port } = await start();
-    const list = JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
-    expect((await send(port, 'POST', '/mcp', MCP, list)).status).toBe(400);
+    expect((await post(port, TOOLS_LIST)).status).toBe(400);
     expect((await send(port, 'GET', '/mcp', { ...MCP, 'mcp-session-id': '' })).status).toBe(400);
     // initialize is never batched; a batch is not an initialize.
-    expect((await send(port, 'POST', '/mcp', MCP, `[${INITIALIZE}]`)).status).toBe(400);
+    expect((await post(port, `[${INITIALIZE}]`)).status).toBe(400);
   });
 
   it('answers 404 to an unknown session', async () => {
@@ -370,20 +381,16 @@ describe('startHttpServer', () => {
   it('serves a session from initialize through DELETE', async () => {
     const { port } = await start();
     const id = await initialize(port);
-    const headers = { ...MCP, 'mcp-session-id': id, 'mcp-protocol-version': '2025-06-18' };
 
-    const notified = await send(port, 'POST', '/mcp', headers,
-      JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }));
+    const notified = await post(port, JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }), id);
     expect(notified.status).toBe(202);
 
-    const listed = await send(port, 'POST', '/mcp', headers,
-      JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }));
+    const listed = await post(port, TOOLS_LIST, id);
     expect(listed.status).toBe(200);
     expect(sseData(listed.body).result!.tools!.map((t) => t.name)).toContain('run_collection');
 
-    expect((await send(port, 'DELETE', '/mcp', headers)).status).toBe(200);
-    expect((await send(port, 'POST', '/mcp', headers,
-      JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/list', params: {} }))).status).toBe(404);
+    expect((await send(port, 'DELETE', '/mcp', { ...MCP, 'mcp-session-id': id })).status).toBe(200);
+    expect((await post(port, TOOLS_LIST, id)).status).toBe(404);
 
     // The 404 alone does not prove the table forgot the session: a closed
     // transport answers 404 by itself. A full set of new sessions fitting
@@ -393,23 +400,15 @@ describe('startHttpServer', () => {
 
   it('gives each initialize its own session', async () => {
     const { port } = await start();
-    const first = await initialize(port);
-    const second = await initialize(port);
-    expect(first).not.toBe(second);
+    expect(await initialize(port)).not.toBe(await initialize(port));
   });
 
   it('closes the server of an initialize the transport rejects', async () => {
-    const stops: jest.SpyInstance[] = [];
-    const factory = (): BrunoMcpServer => {
-      const server = createBrunoMcpServer();
-      stops.push(jest.spyOn(server, 'stop'));
-      return server;
-    };
+    const { factory, stops } = spiedFactory();
     const { port } = await start({}, factory);
     // No Accept header: the transport answers 406 and never assigns a session.
     const { Accept: _accept, ...noAccept } = MCP;
-    const reply = await send(port, 'POST', '/mcp', noAccept, INITIALIZE);
-    expect(reply.status).toBe(406);
+    expect((await send(port, 'POST', '/mcp', noAccept, INITIALIZE)).status).toBe(406);
     expect(stops).toHaveLength(1);
     expect(stops[0]).toHaveBeenCalledTimes(1);
     // The slot was released: a full set of sessions still fits.
@@ -419,7 +418,7 @@ describe('startHttpServer', () => {
   it('refuses an initialize over the session cap with 503', async () => {
     const { port } = await start();
     for (let i = 0; i < MAX_SESSIONS; i++) await initialize(port);
-    const reply = await send(port, 'POST', '/mcp', MCP, INITIALIZE);
+    const reply = await post(port, INITIALIZE);
     expect(reply.status).toBe(503);
     expect(JSON.parse(reply.body).error.message).toBe(`Too many open sessions (limit ${MAX_SESSIONS})`);
   }, 30_000);
@@ -433,8 +432,8 @@ describe('startHttpServer', () => {
       return createBrunoMcpServer();
     };
     const { port, logs } = await start({}, factory);
-    expect((await send(port, 'POST', '/mcp', MCP, INITIALIZE)).status).toBe(500);
-    expect((await send(port, 'POST', '/mcp', MCP, INITIALIZE)).status).toBe(500);
+    expect((await post(port, INITIALIZE)).status).toBe(500);
+    expect((await post(port, INITIALIZE)).status).toBe(500);
     expect(logs.slice(1)).toEqual([
       '[bruno-mcp http] request failed: factory broke',
       '[bruno-mcp http] request failed: unknown error',
@@ -448,14 +447,14 @@ describe('startHttpServer', () => {
       stop: () => Promise.reject(new Error('stop broke')),
     } as unknown as BrunoMcpServer;
     const { port, logs } = await start({}, () => broken);
-    expect((await send(port, 'POST', '/mcp', MCP, INITIALIZE)).status).toBe(500);
+    expect((await post(port, INITIALIZE)).status).toBe(500);
     expect(logs[1]).toBe('[bruno-mcp http] request failed: connect broke');
   });
 
   it('ends the response when a request fails after its headers were sent', async () => {
     const late = {
       connect: (transport: { handleRequest: unknown }) => {
-        transport.handleRequest = async (_req: unknown, res: import('node:http').ServerResponse) => {
+        transport.handleRequest = async (_req: unknown, res: ServerResponse) => {
           res.writeHead(200, { 'Content-Type': 'text/plain' });
           res.write('partial');
           throw new Error('late failure');
@@ -465,8 +464,7 @@ describe('startHttpServer', () => {
       stop: () => Promise.resolve(),
     } as unknown as BrunoMcpServer;
     const { port, logs } = await start({}, () => late);
-    const reply = await send(port, 'POST', '/mcp', MCP, INITIALIZE);
-    expect(reply).toMatchObject({ status: 200, body: 'partial' });
+    expect(await post(port, INITIALIZE)).toMatchObject({ status: 200, body: 'partial' });
     expect(logs[1]).toBe('[bruno-mcp http] request failed: late failure');
   });
 
@@ -478,28 +476,40 @@ describe('startHttpServer', () => {
     });
     const idle = await initialize(port);
     const busy = await initialize(port);
-    const list = JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
-    const headers = (id: string) => ({ ...MCP, 'mcp-session-id': id });
 
     clock = 900;
-    expect((await send(port, 'POST', '/mcp', headers(busy), list)).status).toBe(200);
+    expect((await post(port, TOOLS_LIST, busy)).status).toBe(200);
     clock = 1500;
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await sleep(100);
 
-    expect((await send(port, 'POST', '/mcp', headers(idle), list)).status).toBe(404);
-    expect((await send(port, 'POST', '/mcp', headers(busy), list)).status).toBe(200);
+    expect((await post(port, TOOLS_LIST, idle)).status).toBe(404);
+    expect((await post(port, TOOLS_LIST, busy)).status).toBe(200);
   });
 
-  /** A factory that records a spy on every server's stop(). */
-  function spiedFactory(): { factory: () => BrunoMcpServer; stops: jest.SpyInstance[] } {
-    const stops: jest.SpyInstance[] = [];
-    const factory = (): BrunoMcpServer => {
-      const server = createBrunoMcpServer();
-      stops.push(jest.spyOn(server, 'stop'));
-      return server;
-    };
-    return { factory, stops };
-  }
+  it('never sweeps a session while it has a request open', async () => {
+    let clock = 0;
+    const { port } = await start({ idleTimeoutMs: 1000 }, createBrunoMcpServer, {
+      now: () => clock,
+      sweepIntervalMs: 20,
+    });
+    const id = await initialize(port);
+    const stream = await openSse(port, id);
+    expect(stream.statusCode).toBe(200);
+
+    clock = 5000;
+    await sleep(100);
+    expect((await post(port, TOOLS_LIST, id)).status).toBe(200);
+
+    // Once the stream ends the session can go idle again.
+    stream.destroy();
+    await sleep(100);
+    clock = 5500;
+    await sleep(100);
+    expect((await post(port, TOOLS_LIST, id)).status).toBe(200);
+    clock = 7000;
+    await sleep(100);
+    expect((await post(port, TOOLS_LIST, id)).status).toBe(404);
+  });
 
   it('closes open sessions and the listener on close, once', async () => {
     const { factory, stops } = spiedFactory();
@@ -514,97 +524,39 @@ describe('startHttpServer', () => {
     await expect(send(port, 'GET', '/healthz')).rejects.toMatchObject({ code: 'ECONNREFUSED' });
   });
 
-  it('closes an initialize that registers after close() began', async () => {
+  it('closes an initialize still connecting when close() begins', async () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
-    let connecting!: () => void;
-    const connectStarted = new Promise<void>((resolve) => {
-      connecting = resolve;
-    });
-    const stops: jest.SpyInstance[] = [];
-    const factory = (): BrunoMcpServer => {
-      const server = createBrunoMcpServer();
+    let transportClose: jest.SpyInstance | undefined;
+    const { factory } = spiedFactory((server) => {
       const connect = server.connect.bind(server);
       server.connect = async (transport) => {
-        connecting();
+        transportClose = jest.spyOn(transport, 'close');
         await gate;
         return connect(transport);
       };
-      stops.push(jest.spyOn(server, 'stop'));
-      return server;
-    };
+    });
     const { handle, port } = await start({}, factory);
-    const pending = send(port, 'POST', '/mcp', MCP, INITIALIZE).catch(() => undefined);
-    await connectStarted;
+    const pending = post(port, INITIALIZE).catch(() => undefined);
+    await waitUntil(() => transportClose !== undefined);
+
     const closed = handle.close();
     release();
     await closed;
     await pending;
-    for (let i = 0; i < 50 && stops[0]!.mock.calls.length === 0; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-    expect(stops[0]).toHaveBeenCalled();
-  });
-
-  it('never sweeps a session while it has a request open', async () => {
-    let clock = 0;
-    const { port } = await start({ idleTimeoutMs: 1000 }, createBrunoMcpServer, {
-      now: () => clock,
-      sweepIntervalMs: 20,
-    });
-    const id = await initialize(port);
-    const stream = await new Promise<import('node:http').IncomingMessage>((resolve) => {
-      const req = httpRequest({
-        host: '127.0.0.1',
-        port,
-        method: 'GET',
-        path: '/mcp',
-        agent: false,
-        headers: { ...AUTH, Accept: 'text/event-stream', 'mcp-session-id': id },
-      }, resolve);
-      req.on('error', () => undefined);
-      req.end();
-    });
-    expect(stream.statusCode).toBe(200);
-
-    clock = 5000;
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    const list = JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
-    expect((await send(port, 'POST', '/mcp', { ...MCP, 'mcp-session-id': id }, list)).status).toBe(200);
-
-    // Once the stream ends the session can go idle again.
-    stream.destroy();
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    clock = 5500;
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    expect((await send(port, 'POST', '/mcp', { ...MCP, 'mcp-session-id': id }, list)).status).toBe(200);
-    clock = 7000;
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    expect((await send(port, 'POST', '/mcp', { ...MCP, 'mcp-session-id': id }, list)).status).toBe(404);
+    // Stopping the server is not enough here: its connect has not finished,
+    // so it does not own the transport yet, and the initialize would go on
+    // to register a session behind close().
+    expect(transportClose).toHaveBeenCalled();
   });
 
   it('closes even with an SSE stream held open', async () => {
     const { handle, port } = await start();
-    const id = await initialize(port);
-    const opened = new Promise<void>((resolve) => {
-      const req = httpRequest({
-        host: '127.0.0.1',
-        port,
-        method: 'GET',
-        path: '/mcp',
-        headers: { ...AUTH, Accept: 'text/event-stream', 'mcp-session-id': id },
-      }, (res) => {
-        expect(res.statusCode).toBe(200);
-        res.on('error', () => undefined);
-        res.resume();
-        resolve();
-      });
-      req.on('error', () => undefined);
-      req.end();
-    });
-    await opened;
+    const stream = await openSse(port, await initialize(port));
+    expect(stream.statusCode).toBe(200);
+    stream.resume();
     await expect(handle.close()).resolves.toBeUndefined();
   });
 });

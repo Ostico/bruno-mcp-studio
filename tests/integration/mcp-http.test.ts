@@ -12,14 +12,16 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
-import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 
+import { childEnv } from '../helpers/child-env';
 import { EXPECTED_TOOLS } from '../helpers/expected-tools';
+import { INITIALIZE, MCP_HEADERS, sendRequest, TOOLS_LIST, type Reply } from '../helpers/http-request';
+import { textOf } from '../helpers/tool-text';
 
 const repoRoot = path.resolve(__dirname, '../..');
 // Built once by tests/global-setup.ts before any worker starts.
@@ -37,17 +39,6 @@ const children: ChildProcess[] = [];
 const clients: Client[] = [];
 let tmpRoot: string;
 let server: Server;
-
-/** The parent's environment minus any BRUNO_* a developer exported (see mcp-stdio). */
-function childEnv(overrides: Record<string, string>): Record<string, string> {
-  const base: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (value === undefined) continue;
-    if (key.startsWith('BRUNO_') && key !== 'BRUNO_WORKSPACE_PATH') continue;
-    base[key] = value;
-  }
-  return { ...base, ...overrides };
-}
 
 function spawnServer(args: string[], env: Record<string, string>): { child: ChildProcess; stderr: () => string } {
   const child = spawn(process.execPath, [serverEntry, ...args], {
@@ -78,49 +69,10 @@ async function startServer(): Promise<Server> {
   }
 }
 
-interface RawResponse {
-  status: number;
-  headers: Record<string, string | string[] | undefined>;
-  body: string;
+/** A raw request to the server under test; lets a probe set its own Host. */
+function raw(method: string, path: string, headers: Record<string, string> = {}, body?: string): Promise<Reply> {
+  return sendRequest({ host: server.url.hostname, port: server.url.port, method, path, headers, body });
 }
-
-/**
- * A raw request over node:http, so a probe can set a Host header (fetch will
- * not) and nothing here depends on the process-global fetch dispatcher.
- */
-function raw(
-  method: string,
-  pathname: string,
-  headers: Record<string, string> = {},
-  body?: string,
-): Promise<RawResponse> {
-  return new Promise((resolve, reject) => {
-    const req = httpRequest(
-      { host: server.url.hostname, port: server.url.port, path: pathname, method, headers },
-      (res) => {
-        let text = '';
-        res.on('data', (chunk: Buffer) => {
-          text += chunk.toString('utf8');
-        });
-        res.on('end', () => resolve({ status: res.statusCode ?? 0, headers: res.headers, body: text }));
-      },
-    );
-    req.on('error', reject);
-    req.end(body);
-  });
-}
-
-const INITIALIZE = JSON.stringify({
-  jsonrpc: '2.0',
-  id: 1,
-  method: 'initialize',
-  params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'raw', version: '1' } },
-});
-
-const MCP_HEADERS = {
-  'Content-Type': 'application/json',
-  Accept: 'application/json, text/event-stream',
-};
 
 async function connect(token = TOKEN): Promise<{ client: Client; transport: StreamableHTTPClientTransport }> {
   const transport = new StreamableHTTPClientTransport(server.url, {
@@ -130,11 +82,6 @@ async function connect(token = TOKEN): Promise<{ client: Client; transport: Stre
   clients.push(client);
   await client.connect(transport);
   return { client, transport };
-}
-
-function textOf(result: unknown): string {
-  const content = (result as { content?: Array<{ type: string; text?: string }> }).content ?? [];
-  return content.filter((part) => part.type === 'text').map((part) => part.text ?? '').join('\n');
 }
 
 beforeAll(async () => {
@@ -231,7 +178,7 @@ describe('MCP HTTP transport (real child process)', () => {
       ...MCP_HEADERS,
       Authorization: `Bearer ${TOKEN}`,
       'mcp-session-id': id,
-    }, JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }));
+    }, TOOLS_LIST);
     expect(res.status).toBe(404);
   }, 30_000);
 

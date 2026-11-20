@@ -91,9 +91,10 @@ Environment only:
 
 HTTP mode refuses to start without a token. GET /healthz answers OK without one.`;
 
-/** Flags that take a value, by name. Only the HTTP ones are rejected under stdio. */
-const VALUE_FLAGS = new Set(['--transport', '--host', '--port', '--auth-token-file', '--allowed-hosts']);
+/** Flags that only mean something with --transport http; refused under stdio. */
 const HTTP_ONLY_FLAGS = new Set(['--host', '--port', '--auth-token-file', '--allowed-hosts']);
+/** Every flag that takes a value. */
+const VALUE_FLAGS = new Set(['--transport', ...HTTP_ONLY_FLAGS]);
 
 type ReadFile = (path: string) => string;
 
@@ -135,13 +136,7 @@ function parseFlags(argv: readonly string[]): ParsedFlags {
       continue;
     }
 
-    let value: string | undefined;
-    if (eq !== -1) {
-      value = arg.slice(eq + 1);
-    } else {
-      value = argv[i + 1];
-      i++;
-    }
+    const value = eq === -1 ? argv[++i] : arg.slice(eq + 1);
     if (value === undefined || value === '' || (eq === -1 && value.startsWith('--'))) {
       throw new TransportConfigError(`${name} needs a value`);
     }
@@ -154,12 +149,15 @@ function parseFlags(argv: readonly string[]): ParsedFlags {
   return { flags, help, unknown };
 }
 
-/** A flag wins over its environment variable; an empty variable counts as unset. */
+/** An environment variable, trimmed; empty counts as unset. */
+function envValue(env: NodeJS.ProcessEnv, name: string): string | undefined {
+  const value = env[name]?.trim();
+  return value === '' ? undefined : value;
+}
+
+/** A flag wins over its environment variable. */
 function pick(flags: Map<string, string>, flag: string, env: NodeJS.ProcessEnv, name: string): string | undefined {
-  const fromFlag = flags.get(flag);
-  if (fromFlag !== undefined) return fromFlag;
-  const fromEnv = env[name];
-  return fromEnv === undefined || fromEnv.trim() === '' ? undefined : fromEnv.trim();
+  return flags.get(flag) ?? envValue(env, name);
 }
 
 function parsePort(raw: string, source: string): number {
@@ -193,53 +191,48 @@ function splitTokens(raw: string): string[] {
 }
 
 /**
- * Collect tokens from the environment and the token file. Every message names
- * where a token came from and its position, never its value: these errors are
- * printed, and a printed token is a leaked one.
+ * Check every token in one list. Messages name where a token came from and its
+ * position, never its value: these errors are printed, and a printed token is a
+ * leaked one.
  */
-function resolveTokens(
-  env: NodeJS.ProcessEnv,
-  tokenFile: string | undefined,
-  readFile: ReadFile,
-): string[] {
-  const sources: Array<{ label: string; tokens: string[] }> = [];
-
-  const fromEnv = env.BRUNO_MCP_AUTH_TOKEN;
-  if (fromEnv !== undefined) {
-    sources.push({ label: 'BRUNO_MCP_AUTH_TOKEN', tokens: splitTokens(fromEnv) });
-  }
-
-  if (tokenFile !== undefined) {
-    let content: string;
-    try {
-      content = readFile(tokenFile);
-    } catch (error) {
-      const code = (error as { code?: unknown }).code;
-      const reason = typeof code === 'string' ? code : 'unreadable';
-      throw new TransportConfigError(`Cannot read the token file ${tokenFile} (${reason})`);
+function checkTokens(label: string, tokens: string[]): string[] {
+  for (const [index, token] of tokens.entries()) {
+    if (token.length < MIN_TOKEN_LENGTH) {
+      throw new TransportConfigError(
+        `Token ${index + 1} from ${label} is ${token.length} characters; at least ${MIN_TOKEN_LENGTH} are required`,
+      );
     }
-    sources.push({ label: `token file ${tokenFile}`, tokens: splitTokens(content) });
+    // An Authorization header carries visible ASCII without spaces. A token
+    // outside that range could never be presented, so it is a config typo.
+    if (!/^[\x21-\x7e]+$/.test(token)) {
+      throw new TransportConfigError(
+        `Token ${index + 1} from ${label} contains whitespace or a non-ASCII character`,
+      );
+    }
   }
+  return tokens;
+}
 
-  const tokens: string[] = [];
-  for (const { label, tokens: list } of sources) {
-    list.forEach((token, index) => {
-      if (token.length < MIN_TOKEN_LENGTH) {
-        throw new TransportConfigError(
-          `Token ${index + 1} from ${label} is ${token.length} characters; at least ${MIN_TOKEN_LENGTH} are required`,
-        );
-      }
-      // An Authorization header carries visible ASCII without spaces. A token
-      // outside that range could never be presented, so it is a config typo.
-      if (!/^[\x21-\x7e]+$/.test(token)) {
-        throw new TransportConfigError(
-          `Token ${index + 1} from ${label} contains whitespace or a non-ASCII character`,
-        );
-      }
-      tokens.push(token);
-    });
+function readTokenFile(path: string, readFile: ReadFile): string {
+  try {
+    return readFile(path);
+  } catch (error) {
+    const code = (error as { code?: unknown }).code;
+    throw new TransportConfigError(
+      `Cannot read the token file ${path} (${typeof code === 'string' ? code : 'unreadable'})`,
+    );
   }
+}
 
+/** Every token from the environment and the token file, duplicates removed. */
+function resolveTokens(env: NodeJS.ProcessEnv, tokenFile: string | undefined, readFile: ReadFile): string[] {
+  const fromEnv = envValue(env, 'BRUNO_MCP_AUTH_TOKEN');
+  const tokens = [
+    ...(fromEnv === undefined ? [] : checkTokens('BRUNO_MCP_AUTH_TOKEN', splitTokens(fromEnv))),
+    ...(tokenFile === undefined
+      ? []
+      : checkTokens(`token file ${tokenFile}`, splitTokens(readTokenFile(tokenFile, readFile)))),
+  ];
   if (tokens.length === 0) {
     throw new TransportConfigError(
       'HTTP transport needs a bearer token: set BRUNO_MCP_AUTH_TOKEN or BRUNO_MCP_AUTH_TOKEN_FILE '
@@ -344,7 +337,7 @@ export function resolveTransportConfig(
     pick(flags, '--allowed-hosts', env, 'BRUNO_MCP_ALLOWED_HOSTS'),
     host,
   );
-  const idleTimeoutMs = parseIdleTimeout(env.BRUNO_MCP_SESSION_IDLE_MS?.trim() || undefined);
+  const idleTimeoutMs = parseIdleTimeout(envValue(env, 'BRUNO_MCP_SESSION_IDLE_MS'));
 
   return { kind: 'http', host, port, path: '/mcp', tokens, allowedHosts, idleTimeoutMs };
 }

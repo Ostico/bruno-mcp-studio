@@ -19,7 +19,9 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { McpError } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { createWorkspaceResolver } from '../../src/bruno/workspace';
+import { childEnv } from '../helpers/child-env';
 import { EXPECTED_TOOLS } from '../helpers/expected-tools';
+import { textOf } from '../helpers/tool-text';
 
 const repoRoot = path.resolve(__dirname, '../..');
 
@@ -43,28 +45,6 @@ interface Session {
 
 const sessions: Session[] = [];
 let tmpRoot: string;
-
-/**
- * Child environment: the parent's, minus any BRUNO_* the developer running the
- * suite happens to have exported, plus the caller's explicit overrides. Without
- * the filter a local BRUNO_SSRF_ALLOWLIST would change what these tests prove.
- *
- * BRUNO_WORKSPACE_PATH is the exception, and passes through. tests/setup-workspace-isolation.ts
- * has already replaced whatever the developer exported with a throwaway file, so
- * it is no longer a local setting that could change an outcome — and stripping it
- * sent the child to the Bruno app's own workspace instead, which is how this suite
- * came to leave three entries per run in a maintainer's real registry, each of
- * them pointing at a temp directory that is deleted before the next run.
- */
-function childEnv(overrides: Record<string, string> = {}): Record<string, string> {
-  const base: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (value === undefined) continue;
-    if (key.startsWith('BRUNO_') && key !== 'BRUNO_WORKSPACE_PATH') continue;
-    base[key] = value;
-  }
-  return { ...base, ...overrides };
-}
 
 async function startServer(env: Record<string, string> = {}): Promise<Session> {
   const transport = new StdioClientTransport({
@@ -121,19 +101,6 @@ async function stopAllServers(): Promise<void> {
       }
     }
   }
-}
-
-interface ToolResult {
-  content?: Array<{ type: string; text?: string }>;
-  isError?: boolean;
-}
-
-function textOf(result: unknown): string {
-  const content = (result as ToolResult).content ?? [];
-  return content
-    .filter((part) => part.type === 'text')
-    .map((part) => part.text ?? '')
-    .join('\n');
 }
 
 async function waitForStderr(session: Session, needle: string, timeoutMs = 5000): Promise<void> {

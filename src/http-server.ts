@@ -36,18 +36,6 @@ export interface HttpServerHandle {
   close(): Promise<void>;
 }
 
-interface SessionEntry {
-  server: BrunoMcpServer;
-  transport: StreamableHTTPServerTransport;
-  lastSeen: number;
-  /**
-   * Requests still being answered, an open SSE stream included. A session with
-   * one is in use however long ago it started, so the idle sweep skips it: a
-   * run_collection that outlasts the timeout must not lose its own response.
-   */
-  inFlight: number;
-}
-
 /** Hooks for tests; production uses the defaults. */
 export interface HttpServerOptions {
   now?: () => number;
@@ -123,10 +111,9 @@ function sendJsonRpcError(
   res.end(JSON.stringify({ jsonrpc: '2.0', error: { code, message }, id: null }));
 }
 
-class BodyTooLargeError extends Error {}
-
 /**
- * Read the body, refusing anything over MAX_BODY_BYTES without buffering it.
+ * Read the body as text, or undefined when it is over MAX_BODY_BYTES. Nothing
+ * past the limit is buffered.
  *
  * An oversized body is read to its end and discarded before the refusal is
  * sent. Answering early and closing looks cheaper and does not work: the client
@@ -136,7 +123,7 @@ class BodyTooLargeError extends Error {}
  * the token check gets this far. Node's requestTimeout bounds a body that
  * never ends.
  */
-function readBody(req: IncomingMessage): Promise<string> {
+function readBody(req: IncomingMessage): Promise<string | undefined> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
@@ -145,19 +132,70 @@ function readBody(req: IncomingMessage): Promise<string> {
       if (size <= MAX_BODY_BYTES) chunks.push(chunk);
     });
     req.on('end', () => {
-      if (size > MAX_BODY_BYTES) reject(new BodyTooLargeError());
-      else resolve(Buffer.concat(chunks).toString('utf8'));
+      resolve(size > MAX_BODY_BYTES ? undefined : Buffer.concat(chunks).toString('utf8'));
     });
     req.on('error', reject);
   });
 }
 
-/** Close a server, ignoring a failure: there is nothing left to tell. */
-async function stopQuietly(server: BrunoMcpServer): Promise<void> {
-  try {
-    await server.stop();
-  } catch {
-    /* already closed */
+/**
+ * One client's MCP session: its own server and transport, and whether it is in
+ * use.
+ */
+class Session {
+  readonly transport: StreamableHTTPServerTransport;
+  private lastSeen: number;
+  /**
+   * Requests still being answered, an open SSE stream included. A session with
+   * one is in use however long ago it started, so it is never idle: a
+   * run_collection that outlasts the timeout must not lose its own response.
+   */
+  private inFlight = 0;
+
+  constructor(
+    readonly server: BrunoMcpServer,
+    private readonly now: () => number,
+    onInitialized: (id: string) => void,
+  ) {
+    this.lastSeen = now();
+    this.transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: randomUUID,
+      onsessioninitialized: onInitialized,
+    });
+  }
+
+  /** Assigned by the transport when the initialize is accepted. */
+  get id(): string | undefined {
+    return this.transport.sessionId;
+  }
+
+  /** Count a request as open until its response closes. */
+  track(res: ServerResponse): void {
+    this.inFlight++;
+    this.lastSeen = this.now();
+    res.once('close', () => {
+      this.inFlight--;
+      this.lastSeen = this.now();
+    });
+  }
+
+  isIdleSince(cutoff: number): boolean {
+    return this.inFlight === 0 && this.lastSeen < cutoff;
+  }
+
+  /**
+   * Close the transport, which ends any open SSE stream and fires its onclose,
+   * then the server. The transport goes first because a server whose connect
+   * has not finished yet would not close it. A failure is ignored: there is
+   * nothing left to tell.
+   */
+  async close(): Promise<void> {
+    try {
+      await this.transport.close();
+      await this.server.stop();
+    } catch {
+      /* already closed */
+    }
   }
 }
 
@@ -183,59 +221,33 @@ export async function startHttpServer(
   const now = options.now ?? Date.now;
   const log = options.log ?? ((message: string) => console.error(message));
   const tokenDigests = digestTokens(config.tokens);
-  const sessions = new Map<string, SessionEntry>();
-  // Initializes in flight count toward the cap, or a burst could overshoot it.
-  let pendingInits = 0;
-  // Set by close(): from then on nothing new is served or registered.
-  let shuttingDown = false;
-
-  const closeSession = async (id: string, entry: SessionEntry): Promise<void> => {
-    sessions.delete(id);
-    // Closes the transport too, which ends any open SSE stream.
-    await stopQuietly(entry.server);
-  };
+  // Every session from the moment its server is built until it closes, so the
+  // cap and close() also see an initialize still in flight.
+  const live = new Set<Session>();
+  // Initialized sessions by id, for routing requests.
+  const byId = new Map<string, Session>();
 
   const handleInitialize = async (req: IncomingMessage, res: ServerResponse, body: unknown): Promise<void> => {
-    if (sessions.size + pendingInits >= MAX_SESSIONS) {
+    if (live.size >= MAX_SESSIONS) {
       sendJsonRpcError(res, 503, -32000, `Too many open sessions (limit ${MAX_SESSIONS})`);
       return;
     }
-    pendingInits++;
-    let server: BrunoMcpServer | undefined;
-    let transport: StreamableHTTPServerTransport | undefined;
+    const session = new Session(createServerInstance(), now, (id) => byId.set(id, session));
+    // Set before connect: Protocol.connect chains whatever onclose is already
+    // there, so this runs however the session ends.
+    session.transport.onclose = () => {
+      live.delete(session);
+      if (session.id !== undefined) byId.delete(session.id);
+    };
+    live.add(session);
+    session.track(res);
     try {
-      const instance = createServerInstance();
-      server = instance;
-      let entry: SessionEntry | undefined;
-      const created: StreamableHTTPServerTransport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: randomUUID,
-        onsessioninitialized: (id) => {
-          entry = { server: instance, transport: created, lastSeen: now(), inFlight: 0 };
-          sessions.set(id, entry);
-        },
-      });
-      transport = created;
-      // Set before connect: Protocol.connect chains whatever onclose is already
-      // there, so this still runs when the client DELETEs the session or the
-      // server closes it.
-      created.onclose = () => {
-        const id = created.sessionId;
-        if (id !== undefined && sessions.get(id) === entry) sessions.delete(id);
-      };
-      await instance.connect(created);
-      await created.handleRequest(req, res, body);
+      await session.server.connect(session.transport);
+      await session.transport.handleRequest(req, res, body);
     } finally {
-      pendingInits--;
-      // A rejected initialize (a missing Accept header, say) never gets a
-      // session id, so nothing else would ever close its server.
-      // close() may also have started while this initialize was in flight,
-      // after it took its snapshot of the table; this session is then the
-      // one it cannot see, so it is closed here.
-      const id = transport?.sessionId;
-      if (server !== undefined && (id === undefined || !sessions.has(id) || shuttingDown)) {
-        if (id !== undefined) sessions.delete(id);
-        await stopQuietly(server);
-      }
+      // A rejected initialize (a missing Accept header, say) never gets an id,
+      // so nothing else would ever close it.
+      if (session.id === undefined) await session.close();
     }
   };
 
@@ -249,15 +261,10 @@ export async function startHttpServer(
 
     let body: unknown;
     if (method === 'POST') {
-      let text: string;
-      try {
-        text = await readBody(req);
-      } catch (error) {
-        if (error instanceof BodyTooLargeError) {
-          sendJsonRpcError(res, 413, -32000, `Request body over ${MAX_BODY_BYTES} bytes`);
-          return;
-        }
-        throw error;
+      const text = await readBody(req);
+      if (text === undefined) {
+        sendJsonRpcError(res, 413, -32000, `Request body over ${MAX_BODY_BYTES} bytes`);
+        return;
       }
       try {
         body = JSON.parse(text);
@@ -277,19 +284,14 @@ export async function startHttpServer(
       return;
     }
 
-    const entry = sessions.get(sessionId);
-    if (entry === undefined) {
+    const session = byId.get(sessionId);
+    if (session === undefined) {
       // 404 tells a spec-following client to start a new session.
       sendJsonRpcError(res, 404, -32001, 'Session not found');
       return;
     }
-    entry.lastSeen = now();
-    entry.inFlight++;
-    res.once('close', () => {
-      entry.inFlight--;
-      entry.lastSeen = now();
-    });
-    await entry.transport.handleRequest(req, res, body);
+    session.track(res);
+    await session.transport.handleRequest(req, res, body);
   };
 
   const handle = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
@@ -356,8 +358,8 @@ export async function startHttpServer(
 
   const sweep = setInterval(() => {
     const cutoff = now() - config.idleTimeoutMs;
-    for (const [id, entry] of sessions) {
-      if (entry.inFlight === 0 && entry.lastSeen < cutoff) void closeSession(id, entry);
+    for (const session of live) {
+      if (session.isIdleSince(cutoff)) void session.close();
     }
   }, options.sweepIntervalMs ?? IDLE_SWEEP_MS);
   sweep.unref();
@@ -369,21 +371,17 @@ export async function startHttpServer(
       + 'Any web page the user visits can reach this server if it can reach the port.');
   }
 
-  let closing: Promise<void> | undefined;
-  const close = (): Promise<void> => {
-    closing ??= (async () => {
-      shuttingDown = true;
-      clearInterval(sweep);
-      // Stop accepting first. An initialize already in flight can still
-      // register behind the snapshot below; its own cleanup sees shuttingDown.
-      const listenerClosed = new Promise<void>((resolve) => httpServer.close(() => resolve()));
-      await Promise.all([...sessions].map(([id, entry]) => closeSession(id, entry)));
-      // An open SSE stream would otherwise keep the listener waiting forever.
-      httpServer.closeAllConnections();
-      await listenerClosed;
-    })();
-    return closing;
+  const shutdown = async (): Promise<void> => {
+    clearInterval(sweep);
+    // Stop accepting first, so no session can start behind the snapshot below.
+    const listenerClosed = new Promise<void>((resolve) => httpServer.close(() => resolve()));
+    await Promise.all([...live].map((session) => session.close()));
+    // An open SSE stream would otherwise keep the listener waiting forever.
+    httpServer.closeAllConnections();
+    await listenerClosed;
   };
+  let closing: Promise<void> | undefined;
+  const close = (): Promise<void> => (closing ??= shutdown());
 
   return { url, close };
 }
