@@ -195,6 +195,70 @@ Config schemas are the client's, not this server's, and they move. If a client's
 
 See [INTEGRATION.md](./INTEGRATION.md) for worked examples, Docker, and troubleshooting.
 
+## Running over HTTP
+
+By default the server speaks stdio, one process per client. Over HTTP one process
+serves several clients at once: for example a single server on a host that every
+container on that host talks to, instead of a copy inside each container with the
+collections mounted into it. HTTP mode is opt-in, needs a bearer token, and binds to
+loopback unless told otherwise.
+
+```bash
+export BRUNO_MCP_AUTH_TOKEN="$(openssl rand -hex 32)"
+npx -y @ostico/bruno-mcp --transport http
+# Bruno MCP Server listening on http://127.0.0.1:8781/mcp (auth: bearer, 1 token)
+```
+
+| Setting | Flag | Environment | Default |
+|---|---|---|---|
+| Transport | `--transport stdio\|http` | `BRUNO_MCP_TRANSPORT` | `stdio` |
+| Bind address | `--host` | `BRUNO_MCP_HOST` | `127.0.0.1` |
+| Port (`0` picks a free one) | `--port` | `BRUNO_MCP_PORT` | `8781` |
+| Bearer token(s) | none | `BRUNO_MCP_AUTH_TOKEN`, comma-separated for rotation | required |
+| Token file | `--auth-token-file` | `BRUNO_MCP_AUTH_TOKEN_FILE` | none |
+| Extra allowed hosts | `--allowed-hosts a,b` | `BRUNO_MCP_ALLOWED_HOSTS` | none |
+| Session idle timeout | none | `BRUNO_MCP_SESSION_IDLE_MS` | `1800000` (30 min) |
+
+A flag wins over its environment variable. Each token must be at least 32 characters.
+There is no `--auth-token` flag on purpose: a token on the command line shows up in
+`ps` and in shell history. A token file is read once at startup and may hold one token
+per line. Without any token the server refuses to start; there is no unauthenticated
+HTTP mode.
+
+`localhost`, `127.0.0.1`, `[::1]` and the bind address are always accepted in the
+`Host` header. Add the name your clients use, for example
+`--allowed-hosts host.docker.internal` for Docker containers on the same machine. `*`
+turns the check off and logs a warning. On Docker Desktop and Colima,
+`host.docker.internal` reaches a server bound to the host's loopback. On Linux it is the
+bridge gateway, so bind to that address with `--host` (for example `172.17.0.1`), never
+to `0.0.0.0` on a machine others can reach.
+
+`BRUNO_MCP_TRANSPORT` selects the mode for every server that inherits it, so export it
+only where an HTTP server is meant to start, not in a shell profile that stdio clients
+also read. Under stdio, arguments the server does not recognise are ignored, as before,
+with a warning on stderr; under HTTP they are an error.
+
+Point the client at the `/mcp` endpoint and send the token. In Claude Code's config:
+
+```json
+{
+  "mcpServers": {
+    "bruno-mcp": {
+      "type": "http",
+      "url": "http://host.docker.internal:8781/mcp",
+      "headers": { "Authorization": "Bearer ${BRUNO_MCP_TOKEN}" }
+    }
+  }
+}
+```
+
+`GET /healthz` answers `200 OK` with no token, for readiness checks. It reveals nothing
+else. `bruno-mcp --help` prints the options.
+
+Each client gets its own MCP session. Sessions end when the client closes them, after
+the idle timeout, or when the server stops; a client whose session expired starts a new
+one. At most 64 sessions are open at once.
+
 ## Quick start
 
 ```json
@@ -651,6 +715,20 @@ An allowlist entry matches a target's **exact spelling**. An allowlisted hostnam
 
 This constrains what `run_collection` will fetch. An agent with shell access can reach the network anyway, so treat it as one layer, not a boundary.
 
+**HTTP mode.** Over HTTP the server binds to loopback by default and refuses to start
+without a bearer token. Tokens are compared in constant time and never logged or echoed.
+Every request, `/healthz` included, must carry a `Host` header naming an allowed host,
+and a request with an `Origin` header must come from one, so a web page cannot reach
+the server through DNS rebinding. TLS is not provided: keep the listener on loopback or
+on a private network.
+
+In HTTP mode everything runs on the machine that runs the server, not on the client's.
+Filesystem paths in tool arguments, uploads and report files are that machine's paths,
+the `BRUNO_*` variables are the ones the server was started with, and `run_collection`
+requests leave from that machine. In particular `localhost` in `BRUNO_SSRF_ALLOWLIST`
+means the server's machine, so review the allowlist before sharing one server between
+clients.
+
 ## FAQ
 
 ### Does it need the Bruno CLI (`bru`) installed?
@@ -674,6 +752,14 @@ Only the fields you asked to change. an edit through `write_request` is a partia
 ### Which MCP clients work?
 
 Any of them — this is a plain stdio server with no client-specific code. Claude Code, Claude Desktop, Cursor, Windsurf, VS Code, Codex CLI, opencode, Zed, Cline, Continue, LM Studio, Gemini CLI, the MCP Inspector, or your own SDK client. See [Connect a client](#connect-a-client) for where each one keeps its config.
+
+### Can several clients share one server?
+
+Yes, over HTTP: see [Running over HTTP](#running-over-http). Each client gets its own
+session, and writes from different sessions to the same file are serialised inside the
+server, so two clients setting different variables in one environment both land. Writes
+from outside the server (the Bruno app, or a second server process) are not coordinated
+with it, as with stdio.
 
 ### What happens to my secrets?
 
